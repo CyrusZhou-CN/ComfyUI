@@ -27,11 +27,13 @@ from PIL import Image
 import logging
 import itertools
 from torch.nn.functional import interpolate
+from tqdm.auto import trange
 from einops import rearrange
 from comfy.cli_args import args, enables_dynamic_vram
 import json
 import time
 import mmap
+import warnings
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
@@ -81,11 +83,12 @@ _TYPES = {
 def load_safetensors(ckpt):
     f = open(ckpt, "rb")
     mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    mv = memoryview(mapping)
 
     header_size = struct.unpack("<Q", mapping[:8])[0]
     header = json.loads(mapping[8:8+header_size].decode("utf-8"))
 
-    data_area = torch.frombuffer(mapping, dtype=torch.uint8)[8 + header_size:]
+    mv = mv[8 + header_size:]
 
     sd = {}
     for name, info in header.items():
@@ -93,7 +96,13 @@ def load_safetensors(ckpt):
             continue
 
         start, end = info["data_offsets"]
-        sd[name] = data_area[start:end].view(_TYPES[info["dtype"]]).view(info["shape"])
+        if start == end:
+            sd[name] = torch.empty(info["shape"], dtype =_TYPES[info["dtype"]])
+        else:
+            with warnings.catch_warnings():
+                #We are working with read-only RAM by design
+                warnings.filterwarnings("ignore", message="The given buffer is not writable")
+                sd[name] = torch.frombuffer(mv[start:end], dtype=_TYPES[info["dtype"]]).view(info["shape"])
 
     return sd, header.get("__metadata__", {}),
 
@@ -1147,6 +1156,32 @@ def tiled_scale_multidim(samples, function, tile=(64, 64), overlap=8, upscale_am
 def tiled_scale(samples, function, tile_x=64, tile_y=64, overlap = 8, upscale_amount = 4, out_channels = 3, output_device="cpu", pbar = None):
     return tiled_scale_multidim(samples, function, (tile_y, tile_x), overlap=overlap, upscale_amount=upscale_amount, out_channels=out_channels, output_device=output_device, pbar=pbar)
 
+def model_trange(*args, **kwargs):
+    if comfy.memory_management.aimdo_allocator is None:
+        return trange(*args, **kwargs)
+
+    pbar = trange(*args, **kwargs, smoothing=1.0)
+    pbar._i = 0
+    pbar.set_postfix_str("  Model Initializing ...  ")
+
+    _update = pbar.update
+
+    def warmup_update(n=1):
+        pbar._i += 1
+        if pbar._i == 1:
+            pbar.i1_time = time.time()
+            pbar.set_postfix_str(" Model Initialization complete!  ")
+        elif pbar._i == 2:
+            #bring forward the effective start time based the the diff between first and second iteration
+            #to attempt to remove load overhead from the final step rate estimate.
+            pbar.start_t = pbar.i1_time - (time.time() - pbar.i1_time)
+            pbar.set_postfix_str("")
+
+        _update(n)
+
+    pbar.update = warmup_update
+    return pbar
+
 PROGRESS_BAR_ENABLED = True
 def set_progress_bar_enabled(enabled):
     global PROGRESS_BAR_ENABLED
@@ -1368,3 +1403,21 @@ def string_to_seed(data):
             else:
                 crc >>= 1
     return crc ^ 0xFFFFFFFF
+
+def deepcopy_list_dict(obj, memo=None):
+    if memo is None:
+        memo = {}
+
+    obj_id = id(obj)
+    if obj_id in memo:
+        return memo[obj_id]
+
+    if isinstance(obj, dict):
+        res = {deepcopy_list_dict(k, memo): deepcopy_list_dict(v, memo) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        res = [deepcopy_list_dict(i, memo) for i in obj]
+    else:
+        res = obj
+
+    memo[obj_id] = res
+    return res
